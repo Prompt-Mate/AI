@@ -1,0 +1,247 @@
+
+# ============================================================
+# Prommate Prompt Rewriter LoRA Training (Unsloth)
+# - input(원본 프롬프트) 그룹 단위 split
+# - label(도메인) 분포 유지 stratified split
+# - 데이터 누수 없음
+# - Unsloth + SFTTrainer 호환
+# ============================================================
+
+# ============================================================
+# 0) Google Drive 마운트
+# ============================================================
+from google.colab import drive
+drive.mount('/content/drive')
+
+
+# ============================================================
+# 1) 라이브러리 import
+# ============================================================
+from unsloth import FastLanguageModel
+from datasets import load_dataset, Dataset
+from transformers import TrainingArguments
+from trl import SFTTrainer
+from collections import defaultdict, Counter
+import random
+import os
+
+
+# ============================================================
+# 2) 기본 설정
+# ============================================================
+DATASET_PATH = "/content/drive/MyDrive/sft_dataset_with_structure.jsonl"
+
+BASE_MODEL = "meta-llama/Meta-Llama-3.1-8B-Instruct"
+
+OUTPUT_DIR = "prommate_rewriter_lora"
+SAVE_DIR = "/content/drive/MyDrive/prommate_rewriter_lora_stratified"
+
+TEST_SIZE = 0.10              # eval 비율 (input 기준)
+SEED = 42
+MIN_EVAL_PER_LABEL = 1        # label별 최소 eval input 수
+
+BATCH_SIZE = 2
+GRAD_ACCUM = 4
+LR = 1e-4
+EPOCHS = 2
+MAX_SEQ_LEN = 2048
+LOG_STEPS = 50
+SAVE_STEPS = 300
+
+
+# ============================================================
+# 3) 데이터 로드 + output 없는 row 제거
+#    데이터 구조: {task, input, label, output}
+# ============================================================
+raw_ds = load_dataset("json", data_files=DATASET_PATH)["train"]
+
+def has_output(ex):
+    return ex.get("output") not in [None, "", "None", "null"]
+
+filtered = raw_ds.filter(has_output)
+
+print("전체 row 수:", len(raw_ds))
+print("유효 row 수:", len(filtered))
+print("유니크 input 수:", len(set(filtered["input"])))
+
+
+# ============================================================
+# 4) label 분포를 유지하는 input-group stratified split
+#    - 같은 input의 리라이팅 결과는 항상 한 묶음
+# ============================================================
+def stratified_input_group_split(
+    dataset,
+    test_size=0.1,
+    seed=42,
+    min_eval_per_label=1,
+):
+    groups = defaultdict(list)        # input -> rows
+    input_to_label = {}               # input -> label
+
+    for ex in dataset:
+        inp = ex["input"]
+        lab = ex.get("label", "기타")
+        groups[inp].append(ex)
+        input_to_label[inp] = lab
+
+    label_to_inputs = defaultdict(list)
+    for inp, lab in input_to_label.items():
+        label_to_inputs[lab].append(inp)
+
+    rng = random.Random(seed)
+    eval_inputs = set()
+    train_inputs = set()
+
+    for lab, inputs in label_to_inputs.items():
+        inputs = sorted(inputs)
+        rng.shuffle(inputs)
+
+        n_total = len(inputs)
+        n_eval = int(round(n_total * test_size))
+
+        if n_total > 1:
+            n_eval = max(min_eval_per_label, n_eval)
+            n_eval = min(n_eval, n_total - 1)
+        else:
+            n_eval = 0
+
+        eval_inputs.update(inputs[:n_eval])
+        train_inputs.update(inputs[n_eval:])
+
+    train_rows, eval_rows = [], []
+    for inp, rows in groups.items():
+        if inp in eval_inputs:
+            eval_rows.extend(rows)
+        else:
+            train_rows.extend(rows)
+
+    return (
+        Dataset.from_list(train_rows),
+        Dataset.from_list(eval_rows),
+        eval_inputs,
+    )
+
+
+train_ds, eval_ds, eval_inputs = stratified_input_group_split(
+    filtered,
+    test_size=TEST_SIZE,
+    seed=SEED,
+    min_eval_per_label=MIN_EVAL_PER_LABEL,
+)
+
+print("\n[Split 결과]")
+print("Eval input 수:", len(eval_inputs))
+print("Train row 수:", len(train_ds))
+print("Eval  row 수:", len(eval_ds))
+print("Train label 분포:", Counter(train_ds["label"]))
+print("Eval  label 분포:", Counter(eval_ds["label"]))
+
+
+# ============================================================
+# 5) 모델 로드 (4bit) + LoRA 설정
+# ============================================================
+model, tokenizer = FastLanguageModel.from_pretrained(
+    model_name=BASE_MODEL,
+    load_in_4bit=True,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    lora_alpha=32,
+    lora_dropout=0.05,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
+)
+
+FastLanguageModel.for_training(model)
+
+EOS_TOKEN = tokenizer.eos_token or "</s>"
+
+
+# ============================================================
+# 6) 학습용 text 필드 생성
+# ============================================================
+def build_text(example):
+    system_prompt = (
+        "당신은 생성형 AI 프롬프트를 리라이팅하는 전문가입니다. "
+        "사용자가 작성한 원본 프롬프트의 의도와 정보를 유지하면서, "
+        "지정된 작업 유형(TASK)에 맞게 더 나은 프롬프트로 다시 작성합니다. "
+        "질문에 대한 실제 답변을 생성하지 말고, 오직 '개선된 프롬프트'만 출력합니다."
+    )
+
+    task = example.get("task", "")
+    domain = example.get("label", "")
+
+    user_msg = (
+        f"<TASK: {task}>\n"
+        f"<DOMAIN: {domain}>\n\n"
+        f"원본 프롬프트:\n{example['input']}"
+    )
+
+    assistant_msg = example["output"]
+
+    return (
+        f"<|system|>\n{system_prompt}\n"
+        f"<|user|>\n{user_msg}\n"
+        f"<|assistant|>\n{assistant_msg}{EOS_TOKEN}"
+    )
+
+
+train_processed = train_ds.map(lambda x: {"text": build_text(x)})
+eval_processed  = eval_ds.map(lambda x: {"text": build_text(x)})
+
+print("\n[train_processed 샘플]")
+print(train_processed[0]["text"][:400])
+
+
+# ============================================================
+# 7) Trainer 설정 (Unsloth 호환)
+# ============================================================
+training_args = TrainingArguments(
+    output_dir=OUTPUT_DIR,
+    per_device_train_batch_size=BATCH_SIZE,
+    gradient_accumulation_steps=GRAD_ACCUM,
+    learning_rate=LR,
+    num_train_epochs=EPOCHS,
+    fp16=False,
+    bf16=True,
+    logging_steps=LOG_STEPS,
+    save_steps=SAVE_STEPS,
+    report_to="none",
+    remove_unused_columns=False,
+)
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=train_processed,
+    eval_dataset=eval_processed,
+    dataset_text_field="text",
+    max_seq_length=MAX_SEQ_LEN,
+    args=training_args,
+)
+
+
+# ============================================================
+# 8) 학습
+# ============================================================
+trainer.train()
+
+
+# ============================================================
+# 9) Eval (수동)
+# ============================================================
+metrics = trainer.evaluate()
+print("\n[Eval 결과]")
+print(metrics)
+
+
+# ============================================================
+# 10) 저장
+# ============================================================
+os.makedirs(SAVE_DIR, exist_ok=True)
+model.save_pretrained(SAVE_DIR)
+tokenizer.save_pretrained(SAVE_DIR)
+
+print(f"\n저장 완료: {SAVE_DIR}")
+
