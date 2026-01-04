@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+transformers
+unsloth
+accelerate
+bitsandbytes
+torch
+llama-cpp-python
+pydantic
